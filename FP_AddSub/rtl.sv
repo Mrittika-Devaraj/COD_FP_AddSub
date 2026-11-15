@@ -106,6 +106,7 @@ module fp_addsub (
 
         exp_diff = 0;
         exp_work = 0;
+        i = 0;
 
         guard_bit = 1'b0;
         round_bit = 1'b0;
