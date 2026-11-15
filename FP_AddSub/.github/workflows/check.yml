@@ -1,0 +1,114 @@
+name: FP AddSub check
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y verilator yosys python3-numpy
+
+      - name: Synthesis check (Yosys 0.33, same as course CI)
+        run: |
+          yosys -p "read_verilog -sv FP_AddSub/rtl.sv; synth -top fp_addsub; stat"
+
+      - name: Write reference generator and testbench
+        run: |
+          cat > gen.py <<'PYEOF'
+          import numpy as np, struct, random
+          random.seed(1)
+          def f(x): return np.frombuffer(struct.pack('<I', x), dtype=np.float32)[0]
+          def bits(v): return struct.unpack('<I', np.float32(v).tobytes())[0]
+          def ref(a, b, sub):
+              with np.errstate(all='ignore'):
+                  r = f(a) - f(b) if sub else f(a) + f(b)
+              if np.isnan(r): return 0x7FC00000
+              return bits(r)
+          corner = [0x00000000, 0x80000000, 0x00000001, 0x80000001, 0x007FFFFF, 0x807FFFFF,
+                    0x00800000, 0x80800000, 0x00800001, 0x3F800000, 0xBF800000, 0x3F800001,
+                    0x40000000, 0x7F7FFFFF, 0xFF7FFFFF, 0x7F000000, 0x7F800000, 0xFF800000,
+                    0x7FC00000, 0xFFC00000, 0x7F800001, 0xFFBFFFFF, 0x34000000, 0x33800000,
+                    0x4B000000, 0x4B800000, 0x3F000000, 0x00400000, 0x7F7FFFFE]
+          vecs = [(a, b, s) for a in corner for b in corner for s in (0, 1)]
+          def rnd():
+              m = random.random()
+              if m < 0.25:   return random.getrandbits(32)
+              if m < 0.50:   return (random.getrandbits(1) << 31) | random.getrandbits(23)             # subnormal/zero
+              if m < 0.75:   return (random.getrandbits(1) << 31) | (random.randint(1, 254) << 23) | random.getrandbits(23)
+              return (random.getrandbits(1) << 31) | (random.randint(100, 150) << 23) | random.getrandbits(23)
+          while len(vecs) < 25000:
+              a = rnd()
+              if random.random() < 0.5:   # close exponent -> cancellation
+                  e = ((a >> 23) & 0xFF) + random.randint(-2, 2)
+                  e = min(max(e, 0), 254)
+                  b = (random.getrandbits(1) << 31) | (e << 23) | random.getrandbits(23)
+              else:
+                  b = rnd()
+              vecs.append((a, b, random.getrandbits(1)))
+          with open('vec.txt', 'w') as fh:
+              for a, b, s in vecs:
+                  fh.write(f"{s} {a:08x} {b:08x} {ref(a, b, s):08x}\n")
+          print("generated", len(vecs), "vectors")
+          PYEOF
+          cat > tb.sv <<'SVEOF'
+          module tb;
+            logic clk = 0, reset = 1, in_valid = 0, sub = 0;
+            logic [31:0] a = 0, b = 0;
+            wire out_valid;
+            wire [31:0] result;
+            fp_addsub dut (.clk(clk), .reset(reset), .in_valid(in_valid), .sub(sub),
+                           .a(a), .b(b), .out_valid(out_valid), .result(result));
+            always #5 clk = ~clk;
+
+            integer fd, r, n, bad;
+            logic s;
+            logic [31:0] ea, eb, ex;
+            initial begin
+              n = 0; bad = 0;
+              fd = $fopen("vec.txt", "r");
+              repeat (4) @(posedge clk);
+              reset = 0;
+              @(posedge clk);
+              while (!$feof(fd)) begin
+                r = $fscanf(fd, "%h %h %h %h\n", s, ea, eb, ex);
+                if (r == 4) begin
+                  @(negedge clk);
+                  in_valid = 1; sub = s; a = ea; b = eb;
+                  #2;
+                  n = n + 1;
+                  if (!out_valid || result !== ex) begin
+                    bad = bad + 1;
+                    if (bad <= 15)
+                      $display("FAIL: %s a=%h b=%h  expected=%h got=%h",
+                               s ? "a-b" : "a+b", ea, eb, ex, result);
+                  end
+                  @(negedge clk);
+                  in_valid = 0; a = 32'hDEADBEEF; b = 32'h12345678; sub = 1;
+                  #2;
+                  if (out_valid) begin
+                    bad = bad + 1;
+                    $display("FAIL: out_valid high while in_valid low");
+                  end
+                  @(negedge clk);
+                end
+              end
+              $display("TESTED %0d vectors, %0d failures", n, bad);
+              if (bad == 0) $display("RESULT: PASS"); else $display("RESULT: FAIL");
+              $finish;
+            end
+          endmodule
+          SVEOF
+
+      - name: Simulate against float32 reference
+        run: |
+          python3 gen.py
+          verilator --binary --timing -Wno-fatal -Wno-lint -Wno-style --top-module tb FP_AddSub/rtl.sv tb.sv
+          ./obj_dir/Vtb | tee sim.log
+          grep -q "RESULT: PASS" sim.log
